@@ -1,0 +1,254 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>YouTube Live Chat Viewer (Static)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { --bg:#0b0b10; --panel:#141420; --text:#e8e8ef; --muted:#9aa0a6; --accent:#6ea8fe; }
+  body { margin:0; font:14px/1.45 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:14px 16px; background:var(--panel); display:flex; gap:10px; align-items:center; flex-wrap:wrap; position:sticky; top:0; z-index:5; }
+  header b { font-size:16px; margin-right:auto; }
+  input,button { background:#1c1c2b; color:var(--text); border:1px solid #2b2b3d; border-radius:8px; padding:8px 10px; }
+  button { cursor:pointer; }
+  button.primary { border-color:#325aa8; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  main { display:grid; grid-template-columns: 320px 1fr; gap:14px; padding:14px; }
+  @media (max-width: 900px){ main{ grid-template-columns:1fr; } }
+  .card { background:var(--panel); border:1px solid #212138; border-radius:12px; }
+  .sect { padding:12px; }
+  .row { display:flex; gap:8px; align-items:center; margin:8px 0; flex-wrap:wrap; }
+  small.muted { color:var(--muted); }
+  #chat { list-style:none; margin:0; padding:10px; max-height:70vh; overflow:auto; }
+  #chat li { padding:10px 12px; border-bottom:1px solid #212138; }
+  #chat li:last-child { border-bottom:none; }
+  .author { font-weight:600; margin-right:6px; }
+  .time { color:var(--muted); font-size:12px; margin-left:6px; }
+  .pill { display:inline-block; padding:2px 8px; border:1px solid #314; border-radius:999px; font-size:12px; color:#e7d7ff; background:#271a35; }
+</style>
+
+<header>
+  <b>YT Live Chat (Static)</b>
+  <button id="btnSignIn" class="primary">Sign in</button>
+  <button id="btnSignOut" disabled>Sign out</button>
+  <span id="who" class="pill" title="Signed-in account"></span>
+</header>
+
+<main>
+  <section class="card">
+    <div class="sect">
+      <h3 style="margin:6px 0 4px">Source</h3>
+      <div class="row">
+        <button id="btnFindActive" title="自チャンネルで現在ライブ中を検索">Find my active live</button>
+        <span id="activeStatus"><small class="muted">no live yet</small></span>
+      </div>
+
+      <div class="row">
+        <input id="videoId" placeholder="or paste a YouTube video ID (live)" size="34" />
+        <button id="btnUseVideo">Use video ID</button>
+      </div>
+
+      <div class="row">
+        <input id="chatId" placeholder="or paste a liveChatId directly" size="34" />
+        <button id="btnUseChat">Use liveChatId</button>
+      </div>
+
+      <div class="row">
+        <button id="btnStart" class="primary" disabled>Start reading</button>
+        <button id="btnStop" disabled>Stop</button>
+        <small id="stats" class="muted"></small>
+      </div>
+
+      <details style="margin-top:8px">
+        <summary>Debug</summary>
+        <pre id="debug" style="max-height:180px; overflow:auto; background:#0c0c14; padding:8px; border-radius:8px;"></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="sect">
+      <h3 style="margin:6px 0 8px">Live chat</h3>
+      <ul id="chat"></ul>
+    </div>
+  </section>
+</main>
+
+<!-- Google Identity Services -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+/** ====== CONFIG ====== **/
+const CLIENT_ID = "YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com"; // ←差し替え
+const SCOPE = "https://www.googleapis.com/auth/youtube.readonly"; // 読み取りのみ :contentReference[oaicite:5]{index=5}
+const API = "https://www.googleapis.com/youtube/v3";
+
+/** ====== STATE ====== **/
+let accessToken = null;
+let tokenClient = null;
+let pollTimer = null;
+let nextPageToken = null;
+let liveChatId = null;
+let messageCount = 0;
+
+/** ====== UI helpers ====== **/
+const $ = sel => document.querySelector(sel);
+const logDebug = (...a)=> { const el=$("#debug"); el.textContent += a.join(" ")+"\n"; el.scrollTop = el.scrollHeight; };
+const setStats = (txt)=> $("#stats").textContent = txt;
+const addMsg = ({author, text, ts, thumb})=>{
+  const li = document.createElement("li");
+  const when = new Date(ts);
+  li.innerHTML = `<span class="author">${escapeHtml(author||"")}</span>
+                  <span class="time">${when.toLocaleTimeString()}</span>
+                  <div>${escapeHtml(text||"")}</div>`;
+  $("#chat").appendChild(li);
+  $("#chat").scrollTop = $("#chat").scrollHeight;
+};
+const escapeHtml = (s)=> s.replace(/[&<>"']/g, c=>({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+
+/** ====== AUTH ====== **/
+window.onload = () => {
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPE,
+    callback: (resp) => {
+      if (resp.error) { logDebug("auth error:", resp.error); return; }
+      accessToken = resp.access_token;
+      $("#btnSignOut").disabled = false;
+      $("#btnStart").disabled = !liveChatId;
+      whoAmI().catch(()=>{});
+    }
+  });
+};
+
+$("#btnSignIn").onclick = () => tokenClient.requestAccessToken({ prompt: 'consent' });
+$("#btnSignOut").onclick = () => {
+  if (!accessToken) return;
+  google.accounts.oauth2.revoke(accessToken, ()=> {
+    accessToken = null;
+    $("#who").textContent = "";
+    $("#btnSignOut").disabled = true;
+    stopPolling();
+  });
+};
+
+/** ====== ME (for UX) ====== **/
+async function whoAmI(){
+  const r = await fetch(`${API}/channels?part=snippet&mine=true`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  if (!r.ok) return;
+  const j = await r.json();
+  const ch = j.items?.[0];
+  $("#who").textContent = ch ? `@${ch.snippet.customUrl || ch.snippet.title}` : "";
+}
+
+/** ====== FIND LIVE / RESOLVE CHAT ID ====== **/
+$("#btnFindActive").onclick = async () => {
+  requireAuth();
+  $("#activeStatus").innerHTML = `<small class="muted">searching...</small>`;
+  try {
+    const res = await fetch(`${API}/liveBroadcasts?part=snippet&broadcastStatus=active&mine=true`, {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }); // liveBroadcasts.list で snippet.liveChatId を取得 :contentReference[oaicite:6]{index=6}
+    const j = await res.json();
+    const b = j.items?.[0];
+    liveChatId = b?.snippet?.liveChatId || null;
+    if (liveChatId) {
+      $("#chatId").value = liveChatId;
+      $("#activeStatus").innerHTML = `<small>found liveChatId:</small> <code>${liveChatId}</code>`;
+      $("#btnStart").disabled = !accessToken;
+    } else {
+      $("#activeStatus").innerHTML = `<small class="muted">no active live found</small>`;
+    }
+  } catch (e) {
+    $("#activeStatus").innerHTML = `<small class="muted">error</small>`;
+    logDebug("findActive error:", e);
+  }
+};
+
+$("#btnUseVideo").onclick = async () => {
+  requireAuth();
+  const vid = $("#videoId").value.trim();
+  if (!vid) return alert("Enter a video ID");
+  try {
+    // videos.list で liveStreamingDetails.activeLiveChatId を取得 :contentReference[oaicite:7]{index=7}
+    const r = await fetch(`${API}/videos?part=liveStreamingDetails&id=${encodeURIComponent(vid)}`, {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    const j = await r.json();
+    liveChatId = j.items?.[0]?.liveStreamingDetails?.activeLiveChatId || null;
+    if (!liveChatId) return alert("activeLiveChatId not found (is it live with chat enabled?)");
+    $("#chatId").value = liveChatId;
+    $("#activeStatus").innerHTML = `<small>from video:</small> <code>${liveChatId}</code>`;
+    $("#btnStart").disabled = !accessToken;
+  } catch (e) {
+    logDebug("useVideo error:", e);
+  }
+};
+
+$("#btnUseChat").onclick = () => {
+  liveChatId = $("#chatId").value.trim() || null;
+  if (!liveChatId) return alert("Enter liveChatId");
+  $("#btnStart").disabled = !accessToken;
+  $("#activeStatus").innerHTML = `<small>chat set:</small> <code>${liveChatId}</code>`;
+};
+
+/** ====== POLLING ====== **/
+$("#btnStart").onclick = () => {
+  if (!liveChatId) return alert("No liveChatId");
+  $("#btnStart").disabled = true; $("#btnStop").disabled = false;
+  nextPageToken = null; messageCount = 0; $("#chat").innerHTML = ""; setStats("starting…");
+  poll();
+};
+
+$("#btnStop").onclick = stopPolling;
+
+function stopPolling(){
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  setStats("stopped");
+  $("#btnStart").disabled = !liveChatId || !accessToken;
+  $("#btnStop").disabled = true;
+}
+
+async function poll(){
+  try {
+    // liveChatMessages.list （pollingIntervalMillis と nextPageToken を尊重）:contentReference[oaicite:8]{index=8}
+    const url = new URL(`${API}/liveChat/messages`);
+    url.searchParams.set("part", "snippet,authorDetails");
+    url.searchParams.set("liveChatId", liveChatId);
+    if (nextPageToken) url.searchParams.set("pageToken", nextPageToken);
+
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!res.ok) {
+      const txt = await res.text();
+      logDebug("poll error", res.status, txt);
+      setStats(`error ${res.status}`);
+      // rateLimitExceeded 等は待機して再試行
+      pollTimer = setTimeout(poll, 5000);
+      return;
+    }
+    const j = await res.json();
+    nextPageToken = j.nextPageToken || null;
+
+    // 表示
+    for (const it of (j.items||[])) {
+      const a = it.authorDetails||{}, s = it.snippet||{};
+      // displayMessage に整形済みテキストが入る
+      if (s.displayMessage) {
+        messageCount++;
+        addMsg({ author: a.displayName, text: s.displayMessage, ts: s.publishedAt });
+      }
+    }
+    setStats(`${messageCount} msgs • next in ${j.pollingIntervalMillis ?? 0} ms`);
+
+    // 次回
+    const wait = Math.max(1000, j.pollingIntervalMillis ?? 4000);
+    pollTimer = setTimeout(poll, wait);
+  } catch (e) {
+    logDebug("poll exception:", e);
+    pollTimer = setTimeout(poll, 5000);
+  }
+}
+
+function requireAuth(){
+  if (!accessToken) throw new Error("Not signed in");
+}
+</script>
