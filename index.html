@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8" />
-<title>YouTube Live Chat Viewer/Sender (Static / auto sign-in)</title>
+<title>YouTube Live Chat Viewer/Sender (Static / external login support)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root{--bg:#0b0b10;--panel:#141420;--text:#e8e8ef;--muted:#9aa0a6;--accent:#6ea8fe}
@@ -21,6 +21,7 @@
   #chat li{padding:10px 12px;border-bottom:1px solid #212138} #chat li:last-child{border-bottom:none}
   .author{font-weight:600;margin-right:6px} .time{color:var(--muted);font-size:12px;margin-left:6px}
   code{background:#0c0c14;padding:2px 6px;border-radius:6px}
+  .hint{font-size:12px;color:var(--muted)}
 </style>
 
 <header>
@@ -59,6 +60,26 @@
         <small class="muted">enter で送信</small>
       </div>
 
+      <!-- ▼ 追加: 外部ブラウザログイン（ペアリング） -->
+      <h3 style="margin:14px 0 4px">External login (pairing)</h3>
+      <div class="row">
+        <button id="btnExtStart" disabled>Start external login</button>
+        <button id="btnExtStop" disabled>Stop</button>
+        <small id="extStatus" class="muted"></small>
+      </div>
+      <div id="extBox" style="display:none; margin-top:4px">
+        <div class="row">
+          <label class="hint">Pair code:</label>
+          <input id="extCode" readonly size="8" />
+          <a id="extLink" target="_blank" rel="noopener">open link</a>
+        </div>
+        <div class="row">
+          <img id="extQR" alt="QR" style="max-width:160px;background:#fff;padding:6px;border-radius:8px;display:none">
+          <small class="hint">スマホでQRを開いてサインインしてください（同一ドメインで <code>?auth=1&code=XXXXXX</code> が開きます）</small>
+        </div>
+      </div>
+      <!-- ▲ 追加ここまで -->
+
       <details style="margin-top:8px">
         <summary>Debug</summary>
         <pre id="debug" style="max-height:220px; overflow:auto; background:#0c0c14; padding:8px; border-radius:8px"></pre>
@@ -77,10 +98,24 @@
 <!-- Google Identity Services -->
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
-/* ====== CONFIG ====== */
-const CLIENT_ID = "157676962507-h1npk0jfactaco75nbei28j2v9bd92io.apps.googleusercontent.com"; // ←あなたのWebアプリ用クライアントIDに差し替え
-const SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl";         // 読み書き（送信するため）
+/* =========================
+   CONFIG
+   -------------------------
+   - CLIENT_ID: あなたのWebアプリ用クライアントID
+   - PAIR_BASE: 外部ログイン用のペアリングAPIベースURL
+       期待するエンドポイント:
+         PUT   {PAIR_BASE}/{code}  body: {"access_token":"...", "expires_at": <ms epoch>}
+         GET   {PAIR_BASE}/{code}  → 同上JSON（なければ404/204）
+         DELETE{PAIR_BASE}/{code}  → ペア中断（任意）
+   ========================= */
+const CLIENT_ID = "157676962507-h1npk0jfactaco75nbei28j2v9bd92io.apps.googleusercontent.com";
+const SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl";
 const API = "https://www.googleapis.com/youtube/v3";
+const PAIR_BASE = ""; // 例: "https://your-worker.example.com/pair"（空なら機能OFF）
+
+/* ====== MODE: 通常 or 認証ヘルパー ====== */
+const urlp = new URL(location.href);
+const isAuthMode = urlp.searchParams.get("auth") === "1" || location.hash.includes("auth");
 
 /* ====== STATE ====== */
 let accessToken = null;
@@ -91,10 +126,15 @@ let liveChatId = null;
 let messageCount = 0;
 let refreshTimer = null;
 
+// pairing state
+let pairCode = null;
+let pairPollTimer = null;
+let pairKeepTimer = null;
+
 /* ====== UI helpers ====== */
 const $ = s => document.querySelector(s);
-const logDebug = (...a)=>{ const el=$("#debug"); el.textContent += a.join(" ")+"\n"; el.scrollTop=el.scrollHeight; };
-const setStats = t => $("#stats").textContent = t;
+const logDebug = (...a)=>{ const el=$("#debug"); if(el){ el.textContent += a.join(" ")+"\n"; el.scrollTop=el.scrollHeight; } };
+const setStats = t => { const el=$("#stats"); if(el) el.textContent = t; };
 const escapeHtml = s => (s||"").replace(/[&<>"']/g, c=>({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
 const addMsg = ({author,text,ts})=>{
   const li=document.createElement("li");
@@ -102,33 +142,38 @@ const addMsg = ({author,text,ts})=>{
   li.innerHTML = `<span class="author">${escapeHtml(author||"")}</span>
                   <span class="time">${when.toLocaleTimeString()}</span>
                   <div>${escapeHtml(text||"")}</div>`;
-  $("#chat").appendChild(li);
-  $("#chat").scrollTop=$("#chat").scrollHeight;
+  const chat=$("#chat"); if(chat){ chat.appendChild(li); chat.scrollTop=chat.scrollHeight; }
 };
 
 function setSignedInUI(on){
-  $("#btnSignIn").style.display = on ? "none" : "";
-  $("#btnSignOut").style.display = on ? "" : "none";
-  $("#btnFindActive").disabled = !on;
-  $("#btnUseVideo").disabled  = !on;
-  $("#btnUseChat").disabled   = !on;
-  if(!on){ $("#who").style.display="none"; }
+  if($("#btnSignIn")) $("#btnSignIn").style.display = on ? "none" : "";
+  if($("#btnSignOut")) $("#btnSignOut").style.display = on ? "" : "none";
+  if($("#btnFindActive")) $("#btnFindActive").disabled = !on;
+  if($("#btnUseVideo"))  $("#btnUseVideo").disabled  = !on;
+  if($("#btnUseChat"))   $("#btnUseChat").disabled   = !on;
+  if(!on && $("#who")) { $("#who").style.display="none"; }
   updateSendButton();
 }
 
 function updateSendButton(){
-  $("#btnSend").disabled = !(accessToken && liveChatId);
+  if($("#btnSend")) $("#btnSend").disabled = !(accessToken && liveChatId);
 }
 
-/* ====== AUTH ====== */
-async function initAuth(){
+/* ====== AUTH (GIS) ====== */
+function initAuth(){
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CLIENT_ID,
     scope: SCOPE,
     callback: (resp)=>{} // 呼び出し毎に差し替える
   });
 
-  // 無言サインイン試行（同意済み＆Googleセッションあれば成功）
+  if (isAuthMode) {
+    // 認証ヘルパーは無言サインインは試さない（ユーザー操作で開始）
+    setupAuthHelperUI();
+    return;
+  }
+
+  // 通常モード：無言サインイン（同意済み＆Googleセッションがあれば入る）
   trySilentToken().then(async ok=>{
     if(ok){
       setSignedInUI(true);
@@ -140,6 +185,15 @@ async function initAuth(){
       logDebug("silent auth failed (needs consent or Google session)");
     }
   });
+
+  // 外部ログインUIの有効化
+  if (PAIR_BASE) {
+    $("#btnExtStart").disabled = false;
+    $("#btnExtStop").disabled = true;
+    $("#extStatus").textContent = "ready";
+  } else {
+    $("#extStatus").textContent = "set PAIR_BASE to enable external login";
+  }
 }
 
 function trySilentToken(){
@@ -167,15 +221,20 @@ function interactiveSignIn(){
 function onToken(resp){
   accessToken = resp.access_token;
   scheduleTokenRefresh(resp.expires_in);
-  $("#btnStart").disabled = !liveChatId;
-  $("#btnSignOut").disabled = false;
+  if($("#btnStart")) $("#btnStart").disabled = !liveChatId;
+  if($("#btnSignOut")) $("#btnSignOut").disabled = false;
   updateSendButton();
+
+  // 認証ヘルパーモードでは、取得のたびにPAIRへアップロード
+  if (isAuthMode && pairCode) {
+    pairPut(pairCode, accessToken, resp.expires_in).catch(e=>logDebug("pair PUT fail:", e));
+  }
 }
 
 function scheduleTokenRefresh(expiresIn){
   if(refreshTimer) clearTimeout(refreshTimer);
   const sec = (typeof expiresIn==='number' && expiresIn>0) ? expiresIn : 3600;
-  const refreshInMs = Math.max(60_000, (sec - 600) * 1000); // 失効10分前に更新
+  const refreshInMs = Math.max(60_000, (sec - 600) * 1000); // 失効10分前
   refreshTimer = setTimeout(()=>{
     tokenClient.callback = (resp)=>{ if(resp?.access_token){ onToken(resp); logDebug("token refreshed"); } };
     tokenClient.requestAccessToken({ prompt: '' });
@@ -186,7 +245,7 @@ function signOut(){
   if(!accessToken) return;
   google.accounts.oauth2.revoke(accessToken, ()=>{
     accessToken=null;
-    $("#who").textContent=""; $("#who").style.display="none";
+    if($("#who")) { $("#who").textContent=""; $("#who").style.display="none"; }
     setSignedInUI(false);
     stopReading();
     if(refreshTimer){ clearTimeout(refreshTimer); refreshTimer=null; }
@@ -201,7 +260,7 @@ async function whoAmI(){
   if(!r.ok) return;
   const j = await r.json();
   const ch = j.items?.[0];
-  if(ch){
+  if(ch && $("#who")){
     $("#who").textContent = `@${ch.snippet.customUrl || ch.snippet.title}`;
     $("#who").style.display = "";
   }
@@ -210,7 +269,7 @@ async function whoAmI(){
 /* ====== FIND LIVE / RESOLVE CHAT ID ====== */
 async function findActive(){
   requireAuth();
-  $("#activeStatus").innerHTML = `<small class="muted">searching...</small>`;
+  if($("#activeStatus")) $("#activeStatus").innerHTML = `<small class="muted">searching...</small>`;
   try{
     const res = await fetch(`${API}/liveBroadcasts?part=snippet&broadcastStatus=active&mine=true`, {
       headers: { Authorization: `Bearer ${accessToken}` }
@@ -219,14 +278,14 @@ async function findActive(){
     const b = j.items?.[0];
     liveChatId = b?.snippet?.liveChatId || null;
     if(liveChatId){
-      $("#chatId").value = liveChatId;
-      $("#activeStatus").innerHTML = `<small>found liveChatId:</small> <code>${liveChatId}</code>`;
-      $("#btnStart").disabled = !accessToken;
+      if($("#chatId")) $("#chatId").value = liveChatId;
+      if($("#activeStatus")) $("#activeStatus").innerHTML = `<small>found liveChatId:</small> <code>${liveChatId}</code>`;
+      if($("#btnStart")) $("#btnStart").disabled = !accessToken;
     }else{
-      $("#activeStatus").innerHTML = `<small class="muted">no active live found</small>`;
+      if($("#activeStatus")) $("#activeStatus").innerHTML = `<small class="muted">no active live found</small>`;
     }
   }catch(e){
-    $("#activeStatus").innerHTML = `<small class="muted">error</small>`;
+    if($("#activeStatus")) $("#activeStatus").innerHTML = `<small class="muted">error</small>`;
     logDebug("findActive error:", e);
   }
   updateSendButton();
@@ -240,12 +299,12 @@ async function useVideo(){
     const r = await fetch(`${API}/videos?part=liveStreamingDetails&id=${encodeURIComponent(vid)}`, {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
-    const j = await r.json();
+    const j = await resToJson(r);
     liveChatId = j.items?.[0]?.liveStreamingDetails?.activeLiveChatId || null;
     if(!liveChatId) return alert("activeLiveChatId not found (is it live with chat enabled?)");
-    $("#chatId").value = liveChatId;
-    $("#activeStatus").innerHTML = `<small>from video:</small> <code>${liveChatId}</code>`;
-    $("#btnStart").disabled = !accessToken;
+    if($("#chatId")) $("#chatId").value = liveChatId;
+    if($("#activeStatus")) $("#activeStatus").innerHTML = `<small>from video:</small> <code>${liveChatId}</code>`;
+    if($("#btnStart")) $("#btnStart").disabled = !accessToken;
   }catch(e){ logDebug("useVideo error:", e); }
   updateSendButton();
 }
@@ -253,24 +312,26 @@ async function useVideo(){
 function useChat(){
   liveChatId = $("#chatId").value.trim() || null;
   if(!liveChatId) return alert("Enter liveChatId");
-  $("#btnStart").disabled = !accessToken;
-  $("#activeStatus").innerHTML = `<small>chat set:</small> <code>${liveChatId}</code>`;
+  if($("#btnStart")) $("#btnStart").disabled = !accessToken;
+  if($("#activeStatus")) $("#activeStatus").innerHTML = `<small>chat set:</small> <code>${liveChatId}</code>`;
   updateSendButton();
 }
 
 /* ====== POLLING (read) ====== */
 function startReading(){
   if(!liveChatId) return alert("No liveChatId");
-  $("#btnStart").disabled = true; $("#btnStop").disabled = false;
-  nextPageToken = null; messageCount=0; $("#chat").innerHTML=""; setStats("starting…");
+  if($("#btnStart")) $("#btnStart").disabled = true;
+  if($("#btnStop"))  $("#btnStop").disabled = false;
+  nextPageToken = null; messageCount=0; const chat=$("#chat"); if(chat) chat.innerHTML="";
+  setStats("starting…");
   poll();
 }
 
 function stopReading(){
   if(pollTimer){ clearTimeout(pollTimer); pollTimer=null; }
   setStats("stopped");
-  $("#btnStart").disabled = !liveChatId || !accessToken;
-  $("#btnStop").disabled = true;
+  if($("#btnStart")) $("#btnStart").disabled = !liveChatId || !accessToken;
+  if($("#btnStop"))  $("#btnStop").disabled = true;
 }
 
 async function poll(){
@@ -335,18 +396,163 @@ async function sendMessage(){
   $("#msg").value = "";
 }
 
+/* ====== External login (pairing) ====== */
+function rndCode(len=6){
+  const s="ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 見やすい文字
+  let out=""; for(let i=0;i<len;i++) out+=s[(Math.random()*s.length)|0]; return out;
+}
+async function pairPut(code, token, expiresIn){
+  const expires_at = Date.now() + ((typeof expiresIn==='number'&&expiresIn>0?expiresIn:3600)*1000);
+  const res = await fetch(`${PAIR_BASE}/${encodeURIComponent(code)}`, {
+    method:"PUT", headers:{ "content-type":"application/json" },
+    body: JSON.stringify({ access_token: token, expires_at })
+  });
+  if(!res.ok) throw new Error(`pair PUT ${res.status}`);
+  return { expires_at };
+}
+async function pairGet(code){
+  const res = await fetch(`${PAIR_BASE}/${encodeURIComponent(code)}?t=${Date.now()}`, { cache:"no-store" });
+  if(!res.ok) throw new Error(`pair GET ${res.status}`);
+  return res.json();
+}
+async function pairDelete(code){
+  try{ await fetch(`${PAIR_BASE}/${encodeURIComponent(code)}`, { method:"DELETE" }); }catch{}
+}
+
+function extStart(){
+  if(!PAIR_BASE){ alert("PAIR_BASE is not set."); return; }
+  pairCode = rndCode();
+  const link = `${location.origin}${location.pathname}?auth=1&code=${pairCode}`;
+  $("#extCode").value = pairCode;
+  $("#extLink").href = link;
+  $("#extLink").textContent = "open link";
+  $("#extQR").src = `https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(link)}`;
+  $("#extQR").style.display = "";
+  $("#extBox").style.display = "";
+  $("#extStatus").textContent = "waiting for token…";
+  $("#btnExtStart").disabled = true;
+  $("#btnExtStop").disabled  = false;
+
+  // 5秒間隔でトークン取得（取得後は30秒間隔で差し替え監視）
+  if(pairPollTimer) clearInterval(pairPollTimer);
+  pairPollTimer = setInterval(async ()=>{
+    try{
+      const j = await pairGet(pairCode);
+      if(j && j.access_token){
+        onTokenPair(j.access_token, j.expires_at);
+      }
+    }catch(e){ /* まだ未配置 */ }
+  }, 5000);
+}
+
+function extStop(){
+  if(pairPollTimer) { clearInterval(pairPollTimer); pairPollTimer=null; }
+  if(pairKeepTimer) { clearTimeout(pairKeepTimer); pairKeepTimer=null; }
+  if(pairCode){ pairDelete(pairCode); }
+  pairCode = null;
+  $("#extBox").style.display = "none";
+  $("#btnExtStart").disabled = !PAIR_BASE;
+  $("#btnExtStop").disabled  = true;
+  $("#extStatus").textContent = PAIR_BASE ? "ready" : "set PAIR_BASE";
+}
+
+function onTokenPair(token, expires_at){
+  accessToken = token;
+  setSignedInUI(true);
+  updateSendButton();
+  whoAmI().catch(()=>{});
+  $("#extStatus").textContent = `token ok (exp ${new Date(expires_at).toLocaleTimeString()})`;
+
+  // 失効10分前に強制再チェック（通常は30秒間隔ポーリングで更新され続ける）
+  if(pairKeepTimer) clearTimeout(pairKeepTimer);
+  const ms = Math.max(60_000, (expires_at - Date.now()) - 10*60*1000);
+  pairKeepTimer = setTimeout(async ()=>{
+    try{
+      const j = await pairGet(pairCode);
+      if(j && j.access_token) onTokenPair(j.access_token, j.expires_at);
+    }catch(e){ logDebug("pair refresh fail:", e); }
+  }, ms);
+}
+
+/* ====== 認証ヘルパーUI（?auth=1） ====== */
+function setupAuthHelperUI(){
+  // 通常UIを隠してヘッダだけ活かす
+  const m = document.querySelector("main"); if(m) m.style.display = "none";
+  const who = $("#who"); if(who) who.style.display="none";
+  const b = document.querySelector("header b"); if(b) b.textContent = "YT Live Chat – Auth Helper";
+
+  // 画面を簡易構成で追加
+  const wrap = document.createElement("section");
+  wrap.className = "card";
+  wrap.innerHTML = `
+    <div class="sect">
+      <h3 style="margin:6px 0 4px">External login (Auth helper)</h3>
+      <div class="row">
+        <label class="hint">Pair code:</label>
+        <input id="authCode" size="8" />
+        <button id="authSignIn" class="primary">Sign in</button>
+        <button id="authSignOut" style="display:none">Sign out</button>
+      </div>
+      <div class="row">
+        <small id="authStatus" class="muted">enter code and sign in</small>
+      </div>
+      <details style="margin-top:8px"><summary>Debug</summary>
+        <pre id="debug" style="max-height:220px; overflow:auto; background:#0c0c14; padding:8px; border-radius:8px"></pre>
+      </details>
+    </div>`;
+  document.body.appendChild(wrap);
+
+  // URLの code を自動セット
+  const qCode = urlp.searchParams.get("code");
+  if(qCode) { $("#authCode").value = qCode; }
+
+  // ボタン紐づけ
+  $("#authSignIn").onclick = ()=>{
+    const c = $("#authCode").value.trim();
+    if(!c) return alert("Enter pair code");
+    pairCode = c;
+    $("#authStatus").textContent = "signing in…";
+    tokenClient.callback = (resp)=>{
+      if(resp?.access_token){
+        onToken(resp); // これが pairPut も呼ぶ（auth mode + pairCode）
+        $("#authStatus").textContent = "signed in – token posted";
+        $("#authSignIn").style.display = "none";
+        $("#authSignOut").style.display = "";
+      }
+    };
+    tokenClient.requestAccessToken({ prompt: 'consent' });
+  };
+
+  $("#authSignOut").onclick = ()=>{
+    if(refreshTimer){ clearTimeout(refreshTimer); refreshTimer=null; }
+    if(accessToken){
+      google.accounts.oauth2.revoke(accessToken, ()=>{});
+      accessToken=null;
+    }
+    pairDelete(pairCode);
+    $("#authStatus").textContent = "signed out";
+    $("#authSignOut").style.display = "none";
+    $("#authSignIn").style.display = "";
+  };
+}
+
 /* ====== utils ====== */
+async function resToJson(r){ const t=await r.text(); try{return t?JSON.parse(t):{};}catch{return{};} }
 function requireAuth(){ if(!accessToken) throw new Error("Not signed in"); }
 
 /* ====== wire UI ====== */
-window.addEventListener("load", initAuth);
-$("#btnSignIn").onclick   = interactiveSignIn;
-$("#btnSignOut").onclick  = signOut;
-$("#btnFindActive").onclick = findActive;
-$("#btnUseVideo").onclick   = useVideo;
-$("#btnUseChat").onclick    = useChat;
-$("#btnStart").onclick      = startReading;
-$("#btnStop").onclick       = stopReading;
-$("#btnSend").onclick       = sendMessage;
-$("#msg").addEventListener("keydown", e => { if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendMessage(); }});
-</script>
+window.addEventListener("load", ()=>{
+  if(!window.google || !google.accounts || !google.accounts.oauth2){
+    // GISの読み込み待ち
+    const t = setInterval(()=>{ if(google?.accounts?.oauth2){ clearInterval(t); initAuth(); } }, 50);
+  }else{
+    initAuth();
+  }
+});
+
+if($("#btnSignIn"))   $("#btnSignIn").onclick   = interactiveSignIn;
+if($("#btnSignOut"))  $("#btnSignOut").onclick  = signOut;
+if($("#btnFindActive")) $("#btnFindActive").onclick = findActive;
+if($("#btnUseVideo"))   $("#btnUseVideo").onclick   = useVideo;
+if($("#btnUseChat"))    $("#btnUseChat").onclick    = useChat;
+if($("#btnStart"))      $("#btnStart").onclick      = startReadi
